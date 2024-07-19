@@ -1,0 +1,9 @@
+config.py
+*.old
+
+/__pycache__
+/cache
+/models
+/venv
+/input
+/output
