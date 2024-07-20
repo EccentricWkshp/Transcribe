@@ -1,12 +1,15 @@
 import os
-import time
 import sys
+import time
+import re
 import json
 import requests
+
 from PyQt6.QtWidgets import (QMainWindow, QPushButton, QFileDialog, QTextEdit, QVBoxLayout, QHBoxLayout,
                              QWidget, QProgressBar, QLabel, QComboBox, QMessageBox, QMenuBar, QMenu,
                              QCheckBox, QSizePolicy, QApplication, QDialog, QLineEdit, QTableWidget,
-                             QTableWidgetItem, QHeaderView)
+                             QTableWidgetItem, QHeaderView, QRadioButton, QButtonGroup, QInputDialog,
+                             QTabWidget)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction
 import torch
@@ -19,7 +22,7 @@ class SpeakerNamingDialog(QWidget):
     namesUpdated = pyqtSignal(dict)
 
     def __init__(self, speaker_labels, parent=None):
-        super().__init__(parent, Qt.WindowType.Window)  # Make it a separate window
+        super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("Name Speakers")
         self.setGeometry(300, 300, 400, 300)
         self.speaker_labels = speaker_labels
@@ -83,6 +86,7 @@ class MainWindow(QMainWindow):
         # LLM settings
         self.llm_base_url = None
         self.llm_model = None
+        self.load_llm_settings()  # Load saved LLM settings
 
         # Create output directory
         self.output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -108,6 +112,21 @@ class MainWindow(QMainWindow):
         select_output_action = QAction('Select Output File', self)
         select_output_action.triggered.connect(self.select_output_file)
         file_menu.addAction(select_output_action)
+
+        load_transcript_action = QAction('Load Transcript', self)
+        load_transcript_action.triggered.connect(self.load_transcript)
+        file_menu.addAction(load_transcript_action)
+
+        export_submenu = file_menu.addMenu('Export')
+        export_txt_action = QAction('Export as TXT', self)
+        export_txt_action.triggered.connect(lambda: self.export_transcript('txt'))
+        export_submenu.addAction(export_txt_action)
+        export_srt_action = QAction('Export as SRT', self)
+        export_srt_action.triggered.connect(lambda: self.export_transcript('srt'))
+        export_submenu.addAction(export_srt_action)
+        export_vtt_action = QAction('Export as VTT', self)
+        export_vtt_action.triggered.connect(lambda: self.export_transcript('vtt'))
+        export_submenu.addAction(export_vtt_action)
 
         quit_application_action = QAction('Exit', self)
         quit_application_action.triggered.connect(self.quit_application)
@@ -215,6 +234,17 @@ class MainWindow(QMainWindow):
         self.summarize_button.setEnabled(False)
         button_layout.addWidget(self.summarize_button)
 
+        self.label_speakers_button = QPushButton("Label Speakers")
+        self.label_speakers_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.label_speakers_button.clicked.connect(self.open_speaker_naming_dialog)
+        self.label_speakers_button.setEnabled(False)
+        button_layout.addWidget(self.label_speakers_button)
+
+        # Clear button
+        self.clear_button = QPushButton("Clear All Tabs")
+        self.clear_button.clicked.connect(self.clear_all_tabs)
+        button_layout.addWidget(self.clear_button)
+
         button_layout.addStretch()
         main_layout.addLayout(button_layout)
 
@@ -237,10 +267,10 @@ class MainWindow(QMainWindow):
         time_layout.addWidget(self.elapsed_time_label)
         main_layout.addLayout(time_layout)
 
-        # Text edit for transcription output
-        self.text_edit = QTextEdit()
-        self.text_edit.setReadOnly(True)
-        main_layout.addWidget(self.text_edit)
+        self.tabbed_output = QTabWidget()
+        self.tabbed_output.setTabsClosable(True)
+        self.tabbed_output.tabCloseRequested.connect(self.close_tab)
+        main_layout.addWidget(self.tabbed_output)
 
         # GPU availability label
         self.gpu_label = QLabel()
@@ -257,6 +287,24 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(main_layout)
         self.setCentralWidget(container)
+
+    def clear_all_tabs(self):
+        reply = QMessageBox.question(self, 'Clear All Tabs',
+                                     "Are you sure you want to clear all tabs?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tabbed_output.clear()
+
+    def close_tab(self, index):
+        self.tabbed_output.removeTab(index)
+
+    def add_new_tab(self, content, title):
+        new_tab = QTextEdit()
+        new_tab.setReadOnly(True)
+        new_tab.setPlainText(content)
+        self.tabbed_output.addTab(new_tab, title)
+        self.tabbed_output.setCurrentWidget(new_tab)
+        return new_tab
 
     def update_speaker_options(self):
         use_diarization = self.use_diarization_checkbox.isChecked()
@@ -342,7 +390,8 @@ class MainWindow(QMainWindow):
 
         print(f"File exists, is readable, and has size: {file_size} bytes")
 
-        self.text_edit.clear()
+        self.add_new_tab("", f"Transcription {self.tabbed_output.count() + 1}")
+        self.tabbed_output.setCurrentWidget(new_tab)
         self.transcribe_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
@@ -387,9 +436,11 @@ class MainWindow(QMainWindow):
         self.update_gpu_status()
     
     def append_transcription(self, text):
-        for label, name in self.speaker_names.items():
-            text = text.replace(f"[{label}]:", f"[{name}]:")
-        self.text_edit.append(text)
+        current_tab = self.tabbed_output.currentWidget()
+        if isinstance(current_tab, QTextEdit):
+            for label, name in self.speaker_names.items():
+                text = text.replace(f"[{label}]:", f"[{name}]:")
+            current_tab.append(text)
 
     def handle_speaker_labels(self, speaker_labels):
         self.speaker_naming_dialog = SpeakerNamingDialog(speaker_labels, self)
@@ -398,14 +449,16 @@ class MainWindow(QMainWindow):
 
     def update_speaker_names(self, names):
         self.speaker_names = names
-        self.transcription_thread.assign_speaker_names(self.speaker_names)
+        if self.transcription_thread and self.transcription_thread.isRunning():
+            self.transcription_thread.assign_speaker_names(self.speaker_names)
         self.update_transcript_file()
         self.update_transcript_display()
 
     def update_transcript_display(self):
-        self.text_edit.clear()
-        with open(self.output_file_path, 'r', encoding='utf-8') as f:
-            self.text_edit.setPlainText(f.read())
+        if self.output_file_path:
+            with open(self.output_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.add_new_tab(content, f"Transcript {self.tabbed_output.count() + 1}")
     
     def update_transcript_file(self):
         if not self.output_file_path:
@@ -432,9 +485,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(value)
         self.progress_label.setText(f"{value}%")
 
-    def append_transcription(self, text):
-        self.text_edit.append(text)
-
     def finalize_transcription(self):
         self.reset_ui()
         end_time = time.time()
@@ -442,19 +492,11 @@ class MainWindow(QMainWindow):
         total_time = end_time - self.start_time
         self.elapsed_time_label.setText(f"Elapsed Time: {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
         self.timer.stop()
-        self.update_transcript_display()  # Update the display with final speaker names
+        self.update_transcript_display()
         QMessageBox.information(self, "Transcription Complete", "The transcription has been saved successfully.")
-        self.save_final_transcript()
-
-    def save_final_transcript(self):
-            final_output_path = self.output_file_path.replace('.txt', '_final.txt')
-            with open(self.output_file_path, 'r', encoding='utf-8') as input_file, \
-                open(final_output_path, 'w', encoding='utf-8') as output_file:
-                for line in input_file:
-                    for label, name in self.speaker_names.items():
-                        line = line.replace(f"[{label}]:", f"[{name}]:")
-                    output_file.write(line)
-            QMessageBox.information(self, "Final Transcript Saved", f"The final transcript with custom speaker names has been saved to {final_output_path}")
+        self.label_speakers_button.setEnabled(True)
+        self.summarize_button.setEnabled(True)
+        self.open_speaker_naming_dialog()  # Automatically open the speaker naming dialog
 
     def handle_error(self, error_message):
         self.reset_ui()
@@ -557,15 +599,76 @@ class MainWindow(QMainWindow):
             TranscriptionThread.clear_cache()
             QMessageBox.information(self, 'Cache Cleared', 'The cache has been successfully cleared.')
 
+    def load_llm_settings(self):
+        try:
+            with open('llm_settings.json', 'r') as f:
+                settings = json.load(f)
+                self.llm_base_url = settings.get('base_url')
+                self.llm_model = settings.get('model')
+        except FileNotFoundError:
+            pass  # No saved settings yet
+
+    def save_llm_settings(self):
+        settings = {
+            'base_url': self.llm_base_url,
+            'model': self.llm_model
+        }
+        with open('llm_settings.json', 'w') as f:
+            json.dump(settings, f)
+
     def open_llm_settings(self):
         dialog = LLMSettingsDialog(self)
+        dialog.url_input.setText(self.llm_base_url or "")
+        if self.llm_model:
+            dialog.model_combo.addItem(self.llm_model)
+            dialog.model_combo.setCurrentText(self.llm_model)
+
         if dialog.exec():
             self.llm_base_url = dialog.url_input.text().strip()
             self.llm_model = dialog.model_combo.currentText()
             self.summarize_button.setEnabled(bool(self.llm_base_url and self.llm_model))
-            QMessageBox.information(self, "LLM Settings", "LLM settings updated successfully.")
+            self.save_llm_settings()  # Save the new settings
+            QMessageBox.information(self, "LLM Settings", "LLM settings updated and saved successfully.")
         else:
             QMessageBox.information(self, "LLM Settings", "LLM settings update cancelled.")
+
+    def load_transcript(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Transcript File", "", "Text Files (*.txt)")
+        if file_path:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            if self.is_valid_transcript(content):
+                self.add_new_tab(content, f"Loaded Transcript {self.tabbed_output.count() + 1}")
+                self.output_file_path = file_path
+                self.label_speakers_button.setEnabled(True)
+                self.summarize_button.setEnabled(True)
+            else:
+                QMessageBox.warning(self, "Invalid Transcript", "The selected file does not contain a valid transcript with speaker labels.")
+
+    def is_valid_transcript(self, content):
+        # Check if the transcript contains speaker labels in various formats
+        speaker_pattern = r'\[((?:SPEAKER_\d+|[A-Za-z\s]+))\]:'
+        return bool(re.search(speaker_pattern, content))
+
+    def open_speaker_naming_dialog(self):
+        if not self.output_file_path:
+            QMessageBox.warning(self, "No Transcript", "Please load or create a transcript first.")
+            return
+
+        with open(self.output_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        speaker_pattern = r'\[((?:SPEAKER_\d+|[A-Za-z\s]+))\]:'
+        speaker_labels = list(set(re.findall(speaker_pattern, content)))
+        
+        if not speaker_labels:
+            QMessageBox.warning(self, "No Speakers Found", "No speaker labels found in the transcript.")
+            return
+
+        self.speaker_naming_dialog = SpeakerNamingDialog(speaker_labels, self)
+        self.speaker_naming_dialog.namesUpdated.connect(self.update_speaker_names)
+        self.speaker_naming_dialog.show()
 
     def summarize_transcript(self):
         if not self.llm_base_url or not self.llm_model:
@@ -576,88 +679,213 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No transcript file found. Please transcribe an audio file first.")
             return
 
+        summary_type, ok = QInputDialog.getItem(self, "Summary Type", 
+                                                "Select the type of summary:", 
+                                                ["General Summary", "Meeting Minutes", "Action Items"], 
+                                                0, False)
+        if not ok:
+            return
+
         try:
             with open(self.output_file_path, 'r', encoding='utf-8') as f:
                 transcript = f.read()
 
-            prompt = f"""You are an expert note taker and professional summarizer with a keen ability to distill complex information into clear, concise, and accurate summaries. Your task is to create a comprehensive yet concise summary of the following transcript from a meeting or presentation. Please adhere to these guidelines:
+            # Split the transcript into chunks
+            chunk_size = 4000  # Adjust this value based on your LLM's token limit
+            chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
 
-1. Identify and highlight the main topics, key points, and any crucial decisions or action items discussed.
-2. Organize the summary in a logical structure, using bullet points or numbered lists where appropriate.
-3. Preserve important details, statistics, or specific examples that substantiate main points.
-4. If multiple speakers are involved, note any significant differences in opinions or perspectives.
-5. Conclude with a brief overview of the most important takeaways or next steps, if applicable.
-6. Aim for clarity and brevity while ensuring all vital information is captured.
-7. Use professional language and maintain an objective tone.
-8. Provide only the summary content without any introductory or concluding remarks.
+            summaries = []
+            total_chunks = len(chunks)
 
-Here's the transcript to summarize:
+            for i, chunk in enumerate(chunks):
+                prompt = self.get_summary_prompt(summary_type, chunk)
 
-{transcript}
+                response = requests.post(
+                    f"{self.llm_base_url}/api/generate",
+                    json={
+                        "model": self.llm_model,
+                        "prompt": prompt,
+                        "stream": False
+                    }
+                )
 
-Please provide your expert summary:"""
-            
-            self.update_progress(0)
-            self.text_edit.clear()
-            self.text_edit.append("Starting summarization process...")
-            
-            response = requests.post(
+                if response.status_code == 200:
+                    chunk_summary = response.json()['response']
+                    summaries.append(chunk_summary)
+                    self.update_progress(int((i + 1) / total_chunks * 50))  # First stage progress
+                else:
+                    raise Exception(f"Failed to generate summary for chunk {i+1}. Status code: {response.status_code}")
+
+            # Combine chunk summaries
+            combined_summary = "\n\n".join(summaries)
+
+            # Second stage: Create an overall summary
+            final_prompt = self.get_final_summary_prompt(summary_type, combined_summary)
+
+            final_response = requests.post(
                 f"{self.llm_base_url}/api/generate",
                 json={
                     "model": self.llm_model,
-                    "prompt": prompt,
+                    "prompt": final_prompt,
                     "stream": False
                 }
             )
 
-            if response.status_code == 200:
-                summary = response.json()['response']
-                
-                # Clean up the summary
-                prefixes_to_remove = [
-                    "Here's a summary of the transcript:",
-                    "Here is a summary of the transcript:",
-                    "Based on the provided text, here is an expert summary:",
-                    "Here's an expert summary of the transcript:",
-                    "Summary of the transcript:",
-                    "Here's a summary of the meeting:",
-                    "Here's a concise summary of the conversation:",
-                    "Here is a comprehensive summary of the meeting:",
-                ]
-                for prefix in prefixes_to_remove:
-                    if summary.startswith(prefix):
-                        summary = summary[len(prefix):].strip()
-                
-                suffixes_to_remove = [
-                    "Let me know if you need any clarification or have any questions.",
-                    "Let me know if there is anything I can clarify or expand upon.",
-                    "Is there anything else you would like me to explain or elaborate on?",
-                    "Please let me know if you need any additional information or clarification.",
-                ]
-                for suffix in suffixes_to_remove:
-                    if summary.endswith(suffix):
-                        summary = summary[:-len(suffix)].strip()
-                
-                summary_file = os.path.splitext(self.output_file_path)[0] + "_summary.txt"
+            if final_response.status_code == 200:
+                final_summary = final_response.json()['response']
+                final_summary = self.clean_summary(final_summary)
+
+                summary_file = os.path.splitext(self.output_file_path)[0] + f"_{summary_type.lower().replace(' ', '_')}.txt"
                 with open(summary_file, 'w', encoding='utf-8') as f:
-                    f.write(summary)
-                
-                self.text_edit.clear()
-                self.text_edit.append("Summary of Transcript:")
-                self.text_edit.append(summary)
-                
+                    f.write(final_summary)
+
+                self.add_new_tab(f"{summary_type}:\n\n{final_summary}", summary_type)
+
                 self.update_progress(100)
-                QMessageBox.information(self, "Summary Generated", f"Summary has been saved to {summary_file} and displayed in the main window.")
+                QMessageBox.information(self, "Summary Generated", f"{summary_type} has been saved to {summary_file} and displayed in a new tab.")
             else:
-                self.text_edit.append(f"Error: Failed to generate summary. Status code: {response.status_code}")
-                QMessageBox.warning(self, "Error", f"Failed to generate summary. Status code: {response.status_code}")
-            
-            self.update_progress(0)  # Reset progress bar
+                raise Exception(f"Failed to generate final summary. Status code: {final_response.status_code}")
 
         except Exception as e:
             self.text_edit.append(f"Error: An error occurred while generating the summary: {str(e)}")
             QMessageBox.warning(self, "Error", f"An error occurred while generating the summary: {str(e)}")
-            self.update_progress(0)  # Reset progress bar
+
+        self.update_progress(0)  # Reset progress bar
+
+    def get_summary_prompt(self, summary_type, chunk):
+        if summary_type == "General Summary":
+            return f"""Summarize the following chunk of conversation transcript. Focus on key points, decisions, and important information:
+
+{chunk}
+
+Provide a concise summary:"""
+        elif summary_type == "Meeting Minutes":
+            return f"""Create meeting minutes from the following chunk of conversation transcript. Include:
+1. Key discussion points
+2. Decisions made
+3. Action items (if any)
+4. Important information shared
+
+Chunk:
+{chunk}
+
+Provide structured meeting minutes:"""
+        elif summary_type == "Action Items":
+            return f"""Extract all action items from the following chunk of conversation transcript. An action item should include:
+1. The task to be done
+2. The person responsible (if mentioned)
+3. The deadline (if mentioned)
+
+Chunk:
+{chunk}
+
+List all action items:"""
+
+    def get_final_summary_prompt(self, summary_type, combined_summary):
+        if summary_type == "General Summary":
+            return f"""Create a comprehensive summary of the following transcript summaries. Ensure all major topics and key points are included:
+
+{combined_summary}
+
+Provide a final, coherent summary:"""
+        elif summary_type == "Meeting Minutes":
+            return f"""Compile the following meeting minutes into a final, coherent set of minutes. Organize the information into these sections:
+1. Attendees (if mentioned)
+2. Agenda (if discernible)
+3. Key Discussion Points
+4. Decisions Made
+5. Action Items
+6. Next Steps or Follow-up
+
+Combined minutes:
+{combined_summary}
+
+Provide the final meeting minutes:"""
+        elif summary_type == "Action Items":
+            return f"""Compile and organize the following list of action items. Remove any duplicates and group related items. For each action item, include:
+1. The task to be done
+2. The person responsible (if mentioned)
+3. The deadline (if mentioned)
+
+Action items:
+{combined_summary}
+
+Provide a final, organized list of action items:"""
+
+    def clean_summary(self, summary):
+        prefixes_to_remove = [
+            "Here's a summary of the transcript:",
+            "Here is a summary of the transcript:",
+            "Based on the provided text, here is an expert summary:",
+            "Here's an expert summary of the transcript:",
+            "Summary of the transcript:",
+            "Here's a summary of the meeting:",
+            "Here's a concise summary of the conversation:",
+            "Here is a comprehensive summary of the meeting:",
+        ]
+        for prefix in prefixes_to_remove:
+            if summary.startswith(prefix):
+                summary = summary[len(prefix):].strip()
+
+        suffixes_to_remove = [
+            "Let me know if you need any clarification or have any questions.",
+            "Let me know if there is anything I can clarify or expand upon.",
+            "Is there anything else you would like me to explain or elaborate on?",
+            "Please let me know if you need any additional information or clarification.",
+        ]
+        for suffix in suffixes_to_remove:
+            if summary.endswith(suffix):
+                summary = summary[:-len(suffix)].strip()
+
+        return summary
+
+    def export_transcript(self, format):
+        if not self.output_file_path:
+            QMessageBox.warning(self, "No Transcript", "Please transcribe or load a transcript first.")
+            return
+
+        if format == 'txt':
+            export_path, _ = QFileDialog.getSaveFileName(self, "Export as TXT", "", "Text Files (*.txt)")
+            if export_path:
+                shutil.copy(self.output_file_path, export_path)
+        elif format in ['srt', 'vtt']:
+            export_path, _ = QFileDialog.getSaveFileName(self, f"Export as {format.upper()}", "", f"{format.upper()} Files (*.{format})")
+            if export_path:
+                self.convert_to_subtitle_format(export_path, format)
+
+        if export_path:
+            QMessageBox.information(self, "Export Complete", f"Transcript exported as {format.upper()} to {export_path}")
+
+    def convert_to_subtitle_format(self, export_path, format):
+        with open(self.output_file_path, 'r', encoding='utf-8') as f:
+            transcript = f.read()
+
+        # Split the transcript into segments (you may need to adjust this based on your transcript format)
+        segments = re.split(r'\n(?=\[)', transcript)
+
+        with open(export_path, 'w', encoding='utf-8') as f:
+            if format == 'vtt':
+                f.write("WEBVTT\n\n")
+
+            for i, segment in enumerate(segments):
+                start_time = i * 5  # Assume each segment is 5 seconds long (adjust as needed)
+                end_time = start_time + 5
+
+                if format == 'srt':
+                    f.write(f"{i+1}\n")
+                    f.write(f"{self.format_time(start_time)} --> {self.format_time(end_time)}\n")
+                    f.write(f"{segment.strip()}\n\n")
+                elif format == 'vtt':
+                    f.write(f"{self.format_time(start_time, vtt=True)} --> {self.format_time(end_time, vtt=True)}\n")
+                    f.write(f"{segment.strip()}\n\n")
+
+    def format_time(self, seconds, vtt=False):
+        m, s = divmod(seconds, 60)
+        h, m = divmod(m, 60)
+        if vtt:
+            return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
+        else:
+            return f"{int(h):02d}:{int(m):02d}:{int(s):02d},000"
 
     def quit_application(self):
         self.cancel_transcription()

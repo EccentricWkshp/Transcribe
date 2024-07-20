@@ -10,6 +10,7 @@ import numpy as np
 from pyannote.audio import Pipeline
 from huggingface_hub import HfFolder
 from config import CACHE_DIR, MODELS_DIR, PYANNOTE_AUTH_TOKEN
+import re
 
 # Import and apply the patch
 import patch_pyannote
@@ -34,7 +35,7 @@ class TranscriptionThread(QThread):
     transcription_chunk = pyqtSignal(str)
     transcription_complete = pyqtSignal()
     error_occurred = pyqtSignal(str)
-    speaker_labels_ready = pyqtSignal(list)  # New signal to emit when speaker labels are ready
+    speaker_labels_ready = pyqtSignal(list)
 
     def __init__(self, file_path, model_name, output_file, use_diarization=True, auto_detect_speakers=True, num_speakers=None):
         super().__init__()
@@ -46,7 +47,7 @@ class TranscriptionThread(QThread):
         self.num_speakers = num_speakers
         self.is_cancelled = False
         self.device = self.get_device()
-        self.speaker_names = {}  # Dictionary to store speaker names
+        self.speaker_names = {}
 
     def get_device(self):
         if torch.cuda.is_available():
@@ -134,8 +135,9 @@ class TranscriptionThread(QThread):
                         speaker_name = self.speaker_names.get(current_speaker, current_speaker)
                         f.write(f"\n[{speaker_name}]: ")
                     
-                    f.write(segment['text'] + " ")
-                    self.transcription_chunk.emit(segment['text'] + " ")
+                    formatted_text = self.format_text(segment['text'])
+                    f.write(formatted_text + " ")
+                    self.transcription_chunk.emit(formatted_text + " ")
                     self.progress.emit(50 + int((transcription_with_speakers.index(segment) + 1) / len(transcription_with_speakers) * 50))
 
             if not self.is_cancelled:
@@ -200,6 +202,46 @@ class TranscriptionThread(QThread):
             })
         
         return combined
+
+    def format_text(self, text):
+        # Capitalize the first letter of sentences
+        text = re.sub(r'(^|[.!?]\s+)([a-z])', lambda p: p.group(1) + p.group(2).upper(), text)
+        
+        # Add periods at the end of sentences if missing
+        text = re.sub(r'([a-z])(\s+[A-Z])', r'\1.\2', text)
+        
+        # Correct common spelling mistakes (expand as needed)
+        corrections = {
+            r'\bi\b': 'I',
+            r'\bdont\b': "don't",
+            r'\bwont\b': "won't",
+            r'\bcanr\b': "can't",
+            r'\bim\b': "I'm",
+            r'\bIve\b': "I've",
+            r'\bId\b': "I'd",
+            r'\bIll\b': "I'll",
+            r'\bthats\b': "that's",
+            r'\bwhats\b': "what's",
+            r'\bhows\b': "how's",
+            r'\bwhos\b': "who's",
+            r'\bweres\b': "we're",
+            r'\btheyre\b': "they're",
+            r'\byoure\b': "you're",
+            r'\bcouldnt\b': "couldn't",
+            r'\bwouldnt\b': "wouldn't",
+            r'\bshouldnt\b': "shouldn't",
+            r'\bhasnt\b': "hasn't",
+            r'\bhavent\b': "haven't",
+            r'\bwasnt\b': "wasn't",
+            r'\bwerent\b': "weren't",
+            r'\bisnt\b': "isn't",
+            r'\barent\b': "aren't",
+        }
+        
+        for mistake, correction in corrections.items():
+            text = re.sub(mistake, correction, text)
+        
+        return text
 
     def assign_speaker_names(self, names_dict):
         self.speaker_names = names_dict
