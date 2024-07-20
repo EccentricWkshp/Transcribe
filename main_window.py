@@ -1,3 +1,4 @@
+import ffmpeg
 import os
 import sys
 import time
@@ -14,59 +15,12 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction
 import torch
 
-from transcription_thread import TranscriptionThread
+from llm_manager import LLMSettingsDialog, LLMManager
 from model_manager import ModelManagerDialog, ModelUtils
+from summarization_thread import SummarizationThread
+from transcription_thread import TranscriptionThread
+
 from config import WHISPER_MODELS, MODELS_DIR, PYANNOTE_AUTH_TOKEN
-
-class SpeakerNamingDialog(QWidget):
-    namesUpdated = pyqtSignal(dict)
-
-    def __init__(self, speaker_labels, parent=None):
-        super().__init__(parent, Qt.WindowType.Window)
-        self.setWindowTitle("Name Speakers")
-        self.setGeometry(300, 300, 400, 300)
-        self.speaker_labels = speaker_labels
-        self.setup_ui()
-
-    def setup_ui(self):
-        layout = QVBoxLayout()
-
-        # Create table
-        self.table = QTableWidget(len(self.speaker_labels), 2)
-        self.table.setHorizontalHeaderLabels(["Speaker Label", "Custom Name"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-
-        # Populate table
-        for i, label in enumerate(self.speaker_labels):
-            self.table.setItem(i, 0, QTableWidgetItem(label))
-            self.table.setItem(i, 1, QTableWidgetItem(""))
-
-        layout.addWidget(self.table)
-
-        # Buttons
-        button_layout = QHBoxLayout()
-        apply_button = QPushButton("Apply Names")
-        apply_button.clicked.connect(self.apply_names)
-        button_layout.addWidget(apply_button)
-
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.close)
-        button_layout.addWidget(close_button)
-
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-
-        # Connect cellChanged signal to apply_names method
-        self.table.cellChanged.connect(self.apply_names)
-
-    def apply_names(self):
-        speaker_names = {}
-        for i in range(self.table.rowCount()):
-            label = self.table.item(i, 0).text()
-            name = self.table.item(i, 1).text()
-            if name:
-                speaker_names[label] = name
-        self.namesUpdated.emit(speaker_names)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -84,6 +38,7 @@ class MainWindow(QMainWindow):
         self.speaker_names = {}
 
         # LLM settings
+        self.llm_manager = LLMManager()
         self.llm_base_url = None
         self.llm_model = None
         self.load_llm_settings()  # Load saved LLM settings
@@ -116,6 +71,10 @@ class MainWindow(QMainWindow):
         load_transcript_action = QAction('Load Transcript', self)
         load_transcript_action.triggered.connect(self.load_transcript)
         file_menu.addAction(load_transcript_action)
+
+        load_diarization_action = QAction('Load Diarization', self)
+        load_diarization_action.triggered.connect(self.load_diarization)
+        file_menu.addAction(load_diarization_action)
 
         export_submenu = file_menu.addMenu('Export')
         export_txt_action = QAction('Export as TXT', self)
@@ -325,7 +284,8 @@ class MainWindow(QMainWindow):
             return QFileDialog.getSaveFileName(self, caption, directory, filter, options=options)
 
     def select_input_file(self):
-        self.input_file_path, _ = self.get_file_dialog('open', "Select Audio/Video File", "", "Audio/Video Files (*.mp3 *.mp4 *.wav *.avi)")
+        file_formats = "Audio/Video Files (*.mp3 *.mp4 *.wav *.avi *.mov *.flac *.ogg *.m4a *.webm)"
+        self.input_file_path, _ = QFileDialog.getOpenFileName(self, "Select Audio/Video File", "", file_formats)
         if self.input_file_path:
             self.file_label.setText(f"Selected: {os.path.basename(self.input_file_path)}")
             self.set_default_output_file()
@@ -347,15 +307,17 @@ class MainWindow(QMainWindow):
     def update_file_length(self):
         if self.input_file_path:
             try:
-                import ffmpeg
                 probe = ffmpeg.probe(self.input_file_path)
                 duration = float(probe['streams'][0]['duration'])
                 hours, remainder = divmod(duration, 3600)
                 minutes, seconds = divmod(remainder, 60)
                 self.file_length_label.setText(f"File Length: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
+            except ffmpeg.Error as e:
+                self.file_length_label.setText(f"File Length: Unable to determine")
+                print(f"Error determining file length: {e.stderr.decode()}")
             except Exception as e:
                 self.file_length_label.setText(f"File Length: Unable to determine")
-                print(f"Error determining file length: {str(e)}")
+                print(f"Unexpected error determining file length: {str(e)}")
         else:
             self.file_length_label.setText("File Length: N/A")
 
@@ -391,7 +353,6 @@ class MainWindow(QMainWindow):
         print(f"File exists, is readable, and has size: {file_size} bytes")
 
         self.add_new_tab("", f"Transcription {self.tabbed_output.count() + 1}")
-        self.tabbed_output.setCurrentWidget(new_tab)
         self.transcribe_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
@@ -617,20 +578,9 @@ class MainWindow(QMainWindow):
             json.dump(settings, f)
 
     def open_llm_settings(self):
-        dialog = LLMSettingsDialog(self)
-        dialog.url_input.setText(self.llm_base_url or "")
-        if self.llm_model:
-            dialog.model_combo.addItem(self.llm_model)
-            dialog.model_combo.setCurrentText(self.llm_model)
-
-        if dialog.exec():
-            self.llm_base_url = dialog.url_input.text().strip()
-            self.llm_model = dialog.model_combo.currentText()
-            self.summarize_button.setEnabled(bool(self.llm_base_url and self.llm_model))
-            self.save_llm_settings()  # Save the new settings
-            QMessageBox.information(self, "LLM Settings", "LLM settings updated and saved successfully.")
-        else:
-            QMessageBox.information(self, "LLM Settings", "LLM settings update cancelled.")
+        if self.llm_manager.open_settings_dialog(self):
+            # Settings were saved, you might want to update UI or reload some components
+            pass
 
     def load_transcript(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Transcript File", "", "Text Files (*.txt)")
@@ -638,13 +588,27 @@ class MainWindow(QMainWindow):
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            if self.is_valid_transcript(content):
+            if content:
                 self.add_new_tab(content, f"Loaded Transcript {self.tabbed_output.count() + 1}")
                 self.output_file_path = file_path
                 self.label_speakers_button.setEnabled(True)
                 self.summarize_button.setEnabled(True)
             else:
-                QMessageBox.warning(self, "Invalid Transcript", "The selected file does not contain a valid transcript with speaker labels.")
+                QMessageBox.warning(self, "Invalid Transcript", "The selected file does not contain a valid transcript.")
+    
+    def load_diarization(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Diarization File", "", "Text Files (*.txt)")
+        if file_path:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            if self.is_valid_transcript(content):
+                self.add_new_tab(content, f"Loaded Diarization {self.tabbed_output.count() + 1}")
+                self.output_file_path = file_path
+                self.label_speakers_button.setEnabled(True)
+                self.summarize_button.setEnabled(True)
+            else:
+                QMessageBox.warning(self, "Invalid Diarization", "The selected file does not contain a valid diarization with speaker labels.")
 
     def is_valid_transcript(self, content):
         # Check if the transcript contains speaker labels in various formats
@@ -671,10 +635,6 @@ class MainWindow(QMainWindow):
         self.speaker_naming_dialog.show()
 
     def summarize_transcript(self):
-        if not self.llm_base_url or not self.llm_model:
-            QMessageBox.warning(self, "Error", "Please set up LLM settings first.")
-            return
-
         if not self.output_file_path or not os.path.exists(self.output_file_path):
             QMessageBox.warning(self, "Error", "No transcript file found. Please transcribe an audio file first.")
             return
@@ -690,66 +650,48 @@ class MainWindow(QMainWindow):
             with open(self.output_file_path, 'r', encoding='utf-8') as f:
                 transcript = f.read()
 
-            # Split the transcript into chunks
-            chunk_size = 4000  # Adjust this value based on your LLM's token limit
-            chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
+            self.start_time = time.time()
+            self.start_time_label.setText(f"Start Time: {time.strftime('%H:%M:%S')}")
+            self.end_time_label.setText("End Time: Not finished")
+            self.elapsed_time_label.setText("Elapsed Time: 00:00:00")
+            self.timer.start(1000)  # Update every second
 
-            summaries = []
-            total_chunks = len(chunks)
-
-            for i, chunk in enumerate(chunks):
-                prompt = self.get_summary_prompt(summary_type, chunk)
-
-                response = requests.post(
-                    f"{self.llm_base_url}/api/generate",
-                    json={
-                        "model": self.llm_model,
-                        "prompt": prompt,
-                        "stream": False
-                    }
-                )
-
-                if response.status_code == 200:
-                    chunk_summary = response.json()['response']
-                    summaries.append(chunk_summary)
-                    self.update_progress(int((i + 1) / total_chunks * 50))  # First stage progress
-                else:
-                    raise Exception(f"Failed to generate summary for chunk {i+1}. Status code: {response.status_code}")
-
-            # Combine chunk summaries
-            combined_summary = "\n\n".join(summaries)
-
-            # Second stage: Create an overall summary
-            final_prompt = self.get_final_summary_prompt(summary_type, combined_summary)
-
-            final_response = requests.post(
-                f"{self.llm_base_url}/api/generate",
-                json={
-                    "model": self.llm_model,
-                    "prompt": final_prompt,
-                    "stream": False
-                }
-            )
-
-            if final_response.status_code == 200:
-                final_summary = final_response.json()['response']
-                final_summary = self.clean_summary(final_summary)
-
-                summary_file = os.path.splitext(self.output_file_path)[0] + f"_{summary_type.lower().replace(' ', '_')}.txt"
-                with open(summary_file, 'w', encoding='utf-8') as f:
-                    f.write(final_summary)
-
-                self.add_new_tab(f"{summary_type}:\n\n{final_summary}", summary_type)
-
-                self.update_progress(100)
-                QMessageBox.information(self, "Summary Generated", f"{summary_type} has been saved to {summary_file} and displayed in a new tab.")
-            else:
-                raise Exception(f"Failed to generate final summary. Status code: {final_response.status_code}")
+            self.summarization_thread = SummarizationThread(self.llm_manager, transcript, summary_type)
+            self.summarization_thread.progress.connect(self.update_progress)
+            self.summarization_thread.summary_chunk.connect(self.append_summary)
+            self.summarization_thread.summary_complete.connect(self.finalize_summary)
+            self.summarization_thread.error_occurred.connect(self.handle_summarization_error)
+            self.summarization_thread.start()
 
         except Exception as e:
-            self.text_edit.append(f"Error: An error occurred while generating the summary: {str(e)}")
             QMessageBox.warning(self, "Error", f"An error occurred while generating the summary: {str(e)}")
+            self.update_progress(0)  # Reset progress bar
 
+    def append_summary(self, text):
+        current_tab = self.tabbed_output.currentWidget()
+        if isinstance(current_tab, QTextEdit):
+            current_tab.append(text)
+    
+    def finalize_summary(self, final_summary):
+        end_time = time.time()
+        self.end_time_label.setText(f"End Time: {time.strftime('%H:%M:%S')}")
+        total_time = end_time - self.start_time
+        self.elapsed_time_label.setText(f"Elapsed Time: {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
+        self.timer.stop()
+
+        final_summary = self.clean_summary(final_summary)
+        summary_type = self.summarization_thread.summary_type
+        summary_file = os.path.splitext(self.output_file_path)[0] + f"_{summary_type.lower().replace(' ', '_')}.txt"
+        
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write(final_summary)
+
+        self.add_new_tab(f"{summary_type}:\n\n{final_summary}", summary_type)
+        QMessageBox.information(self, "Summary Generated", f"{summary_type} has been saved to {summary_file} and displayed in a new tab.")
+    
+    def handle_summarization_error(self, error_message):
+        self.timer.stop()
+        QMessageBox.warning(self, "Error", f"An error occurred while generating the summary: {error_message}")
         self.update_progress(0)  # Reset progress bar
 
     def get_summary_prompt(self, summary_type, chunk):
@@ -760,11 +702,27 @@ class MainWindow(QMainWindow):
 
 Provide a concise summary:"""
         elif summary_type == "Meeting Minutes":
-            return f"""Create meeting minutes from the following chunk of conversation transcript. Include:
-1. Key discussion points
-2. Decisions made
-3. Action items (if any)
-4. Important information shared
+            return f"""Please create detailed meeting minutes from the following transcript. Include:
+
+1. Date, time, and all attendees mentioned
+2. All agenda items discussed
+3. Key points of discussion for each agenda item, including:
+    a. Detailed summaries of reports or updates given
+    b. Important questions raised and answers provided
+    c. Significant opinions or concerns expressed by participants
+4. Any decisions made or actions agreed upon
+5. Specific assignments or action items for individuals or groups
+6. Any voting results
+7. Upcoming events, future meeting dates, or deadlines mentioned
+8. Brief summaries of any presentations or guest speakers
+9. Notable quotes or important statements from participants
+
+Organize the information clearly under appropriate headings, maintaining the original sequence of topics as discussed in the meeting. Include relevant details but summarize lengthy discussions. Use professional language and format the minutes in a clear, easy-to-read structure.
+If exact dates, times, or names are unclear, use placeholders and add a note to fill in the correct information before finalizing the minutes.
+Please pay special attention to capturing the essence of program updates, committee reports, and any detailed discussions on specific projects or initiatives.
+Anyone not attending the meeting should be able to read the minutes and get an understanding of the discussion.
+
+Here's the transcript to summarize:
 
 Chunk:
 {chunk}
@@ -789,15 +747,31 @@ List all action items:"""
 
 Provide a final, coherent summary:"""
         elif summary_type == "Meeting Minutes":
-            return f"""Compile the following meeting minutes into a final, coherent set of minutes. Organize the information into these sections:
-1. Attendees (if mentioned)
-2. Agenda (if discernible)
-3. Key Discussion Points
-4. Decisions Made
-5. Action Items
-6. Next Steps or Follow-up
+            return f"""Create a final, comprehensive set of meeting minutes from the following summaries. Your task is to:
 
-Combined minutes:
+1. Compile all information into a single, coherent document
+2. Maintain the chronological order of discussions
+3. Eliminate any redundancies
+4. Ensure a professional, easy-to-read format with clear headings and subheadings
+5. Include all key points, discussions, decisions, action items, and assignments
+6. Standardize the language and style throughout the document
+
+The minutes should include:
+- Meeting date, time, and attendees (if available)
+- Agenda items discussed
+- Key points of discussion for each item with a summary of the discussion
+- Decisions made and actions agreed upon
+- Important updates or reports
+- Assignments or action items for individuals or groups
+- Voting results (if any)
+- Upcoming events or future meeting dates
+- Summaries of any presentations or guest speakers
+
+Be sure to organize the information clearly under appropriate headings. Maintain the original sequence of topics as they were discussed in the meeting.
+Include relevant details but summarize lengthy discussions. Use professional language and format the minutes in a clear, easy-to-read structure.
+If exact dates, times, or names are unclear, use placeholders and add a note to fill in the correct information before finalizing the minutes.
+
+Here are the summaries to compile:
 {combined_summary}
 
 Provide the final meeting minutes:"""
@@ -822,6 +796,7 @@ Provide a final, organized list of action items:"""
             "Here's a summary of the meeting:",
             "Here's a concise summary of the conversation:",
             "Here is a comprehensive summary of the meeting:",
+            "Meeting Minutes:",
         ]
         for prefix in prefixes_to_remove:
             if summary.startswith(prefix):
@@ -832,6 +807,7 @@ Provide a final, organized list of action items:"""
             "Let me know if there is anything I can clarify or expand upon.",
             "Is there anything else you would like me to explain or elaborate on?",
             "Please let me know if you need any additional information or clarification.",
+            "*Please fill in any placeholders with relevant information.*",
         ]
         for suffix in suffixes_to_remove:
             if summary.endswith(suffix):
@@ -891,59 +867,55 @@ Provide a final, organized list of action items:"""
         self.cancel_transcription()
         QApplication.quit()
 
-class LLMSettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("LLM Settings")
-        self.setGeometry(300, 300, 400, 200)
-        
+class SpeakerNamingDialog(QWidget):
+    namesUpdated = pyqtSignal(dict)
+
+    def __init__(self, speaker_labels, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("Name Speakers")
+        self.setGeometry(300, 300, 400, 300)
+        self.speaker_labels = speaker_labels
+        self.setup_ui()
+
+    def setup_ui(self):
         layout = QVBoxLayout()
-        
-        # Ollama base URL input
-        url_layout = QHBoxLayout()
-        url_layout.addWidget(QLabel("Ollama Base URL:"))
-        self.url_input = QLineEdit()
-        self.url_input.setText("http://127.0.0.1:11434")
-        url_layout.addWidget(self.url_input)
-        layout.addLayout(url_layout)
-        
-        # Model selection
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("Select Model:"))
-        self.model_combo = QComboBox()
-        model_layout.addWidget(self.model_combo)
-        layout.addLayout(model_layout)
-        
+
+        # Create table
+        self.table = QTableWidget(len(self.speaker_labels), 2)
+        self.table.setHorizontalHeaderLabels(["Speaker Label", "Custom Name"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        # Populate table
+        for i, label in enumerate(self.speaker_labels):
+            self.table.setItem(i, 0, QTableWidgetItem(label))
+            self.table.setItem(i, 1, QTableWidgetItem(""))
+
+        layout.addWidget(self.table)
+
         # Buttons
         button_layout = QHBoxLayout()
-        self.fetch_button = QPushButton("Fetch Models")
-        self.fetch_button.clicked.connect(self.fetch_models)
-        button_layout.addWidget(self.fetch_button)
-        
-        self.ok_button = QPushButton("OK")
-        self.ok_button.clicked.connect(self.accept)
-        button_layout.addWidget(self.ok_button)
-        
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(self.cancel_button)
-        
+        apply_button = QPushButton("Apply Names")
+        apply_button.clicked.connect(self.apply_names)
+        button_layout.addWidget(apply_button)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        button_layout.addWidget(close_button)
+
         layout.addLayout(button_layout)
-        
         self.setLayout(layout)
-    
-    def fetch_models(self):
-        base_url = self.url_input.text().strip()
-        try:
-            response = requests.get(f"{base_url}/api/tags")
-            if response.status_code == 200:
-                models = response.json()['models']
-                self.model_combo.clear()
-                self.model_combo.addItems([model['name'] for model in models])
-            else:
-                QMessageBox.warning(self, "Error", f"Failed to fetch models. Status code: {response.status_code}")
-        except requests.RequestException as e:
-            QMessageBox.warning(self, "Error", f"Failed to connect to Ollama: {str(e)}")
+
+        # Connect cellChanged signal to apply_names method
+        self.table.cellChanged.connect(self.apply_names)
+
+    def apply_names(self):
+        speaker_names = {}
+        for i in range(self.table.rowCount()):
+            label = self.table.item(i, 0).text()
+            name = self.table.item(i, 1).text()
+            if name:
+                speaker_names[label] = name
+        self.namesUpdated.emit(speaker_names)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

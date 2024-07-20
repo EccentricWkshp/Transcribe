@@ -1,5 +1,9 @@
+.gitignore
 *config.*
+*settings.*
+*.json
 *.old
+llm_settings.json
 
 /__pycache__
 /cache
@@ -7,3 +11,4 @@
 /venv
 /input
 /output
+llm_settings.json

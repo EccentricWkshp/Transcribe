@@ -1,16 +1,18 @@
+import ffmpeg
+import numpy as np
 import os
+import re
 import sys
 import shutil
-import torch
 import subprocess
+import torch
+import whisper
+
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
-import whisper
-import numpy as np
 from pyannote.audio import Pipeline
 from huggingface_hub import HfFolder
 from config import CACHE_DIR, MODELS_DIR, PYANNOTE_AUTH_TOKEN
-import re
 
 # Import and apply the patch
 import patch_pyannote
@@ -63,13 +65,20 @@ class TranscriptionThread(QThread):
         print(f"TranscriptionThread: {message}")
 
     def convert_audio(self, input_file):
-        output_file = os.path.join(CACHE_DIR, os.path.basename(input_file).rsplit('.', 1)[0] + ".wav")
+        output_file = os.path.join(CACHE_DIR, f"{os.path.splitext(os.path.basename(input_file))[0]}.wav")
         self.log(f"Converting {input_file} to {output_file}")
         try:
-            subprocess.run(["ffmpeg", "-i", input_file, "-acodec", "pcm_s16le", "-ar", "16000", "-y", output_file], check=True)
+            subprocess.run([
+                "ffmpeg",
+                "-i", input_file,
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                "-y", output_file
+            ], check=True, capture_output=True, text=True)
             return output_file
         except subprocess.CalledProcessError as e:
-            self.log(f"Error converting file: {e}")
+            self.log(f"Error converting file: {e.stdout}\n{e.stderr}")
             return input_file
 
     def run(self):
@@ -89,13 +98,15 @@ class TranscriptionThread(QThread):
             
             self.log("Starting transcription")
             self.progress.emit(10)
+
+            # Convert the input file to a suitable audio format
+            audio_file = self.convert_audio(self.file_path)
             
-            result = model.transcribe(self.file_path, fp16=(self.device.type == "cuda"))
+            result = model.transcribe(audio_file, fp16=(self.device.type == "cuda"))
             self.progress.emit(50)
             
             if self.use_diarization:
                 self.log("Starting diarization")
-                converted_file = self.convert_audio(self.file_path)
 
                 pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization",
                                                     use_auth_token=PYANNOTE_AUTH_TOKEN)
@@ -108,7 +119,7 @@ class TranscriptionThread(QThread):
                     diarization_options['num_speakers'] = self.num_speakers
 
                 self.log(f"Running diarization with options: {diarization_options}")
-                diarization = pipeline(converted_file, **diarization_options)
+                diarization = pipeline(audio_file, **diarization_options)
 
                 self.log("Diarization complete, combining results")
                 self.log(f"Diarization output: {diarization}")
@@ -146,12 +157,12 @@ class TranscriptionThread(QThread):
                 self.log("Transcription and diarization completed successfully")
 
             # Clean up temporary file
-            if self.use_diarization and converted_file != self.file_path:
+            if audio_file != self.file_path:
                 try:
-                    os.remove(converted_file)
-                    self.log(f"Temporary file removed: {converted_file}")
+                    os.remove(audio_file)
+                    self.log(f"Temporary file removed: {audio_file}")
                 except FileNotFoundError:
-                    self.log(f"Temporary file not found, skipping removal: {converted_file}")
+                    self.log(f"Temporary file not found, skipping removal: {audio_file}")
                 except Exception as e:
                     self.log(f"Error removing temporary file: {str(e)}")
 
