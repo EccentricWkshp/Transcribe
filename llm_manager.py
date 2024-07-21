@@ -254,7 +254,7 @@ class LLMSettingsDialog(QDialog):
 
         print(f"Saving settings: {self.settings}")  # Debug print
 
-        QMessageBox.information(self, "Settings Saved", "LLM settings have been saved successfully.")
+        #QMessageBox.information(self, "Settings Saved", "LLM settings have been saved successfully.")
         self.accept()
 
     def on_provider_changed(self, provider):

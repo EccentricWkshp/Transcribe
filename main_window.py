@@ -28,6 +28,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Whisper Transcription App with Speaker Diarization")
         self.setGeometry(100, 100, 700, 500)
 
+        self.current_process = None
         self.input_file_path = None
         self.output_file_path = None
         self.transcription_thread = None
@@ -182,7 +183,7 @@ class MainWindow(QMainWindow):
 
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.cancel_button.clicked.connect(self.cancel_transcription)
+        self.cancel_button.clicked.connect(self.cancel_current_process)
         self.cancel_button.setEnabled(False)
         self.cancel_button.setStyleSheet("background-color: #f44336;")
         button_layout.addWidget(self.cancel_button)
@@ -390,8 +391,11 @@ class MainWindow(QMainWindow):
         self.transcription_thread.transcription_chunk.connect(self.append_transcription)
         self.transcription_thread.transcription_complete.connect(self.finalize_transcription)
         self.transcription_thread.error_occurred.connect(self.handle_error)
-        self.transcription_thread.speaker_labels_ready.connect(self.handle_speaker_labels)
+        #self.transcription_thread.speaker_labels_ready.connect(self.handle_speaker_labels)
         self.transcription_thread.start()
+
+        self.current_process = self.transcription_thread  # Set the current process
+        self.cancel_button.setEnabled(True)  # Enable the cancel button
 
         # Update GPU status after starting transcription
         self.update_gpu_status()
@@ -419,8 +423,20 @@ class MainWindow(QMainWindow):
         if self.output_file_path:
             with open(self.output_file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            self.add_new_tab(content, f"Transcript {self.tabbed_output.count() + 1}")
-    
+            
+            transcript_tab = self.find_transcript_tab()
+            if transcript_tab:
+                transcript_tab.setPlainText(content)
+            else:
+                self.add_new_tab(content, f"Transcript {self.tabbed_output.count() + 1}")
+
+    def find_transcript_tab(self):
+        for i in range(self.tabbed_output.count()):
+            tab = self.tabbed_output.widget(i)
+            if isinstance(tab, QTextEdit) and self.tabbed_output.tabText(i).startswith("Transcript"):
+                return tab
+        return None
+
     def update_transcript_file(self):
         if not self.output_file_path:
             return
@@ -434,13 +450,19 @@ class MainWindow(QMainWindow):
                     line = line.replace(f"[{label}]:", f"[{name}]:")
                 file.write(line)
 
-    def cancel_transcription(self):
-        if self.transcription_thread and self.transcription_thread.isRunning():
-            self.transcription_thread.cancel()
-            self.transcription_thread.wait()
+    def cancel_current_process(self):
+        if self.current_process and self.current_process.isRunning():
+            self.current_process.cancel()
+            self.current_process.wait()
             self.reset_ui()
             self.timer.stop()
-            QMessageBox.information(self, "Transcription Cancelled", "The transcription process has been cancelled.")
+            
+            process_name = "transcription" if isinstance(self.current_process, TranscrationThread) else "summarization"
+            QMessageBox.information(self, f"{process_name.capitalize()} Cancelled", f"The {process_name} process has been cancelled.")
+            
+            self.current_process = None
+        #else:
+        #    QMessageBox.information(self, "No Active Process", "There is no active process to cancel.")
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
@@ -473,10 +495,13 @@ class MainWindow(QMainWindow):
 
     def reset_ui(self):
         self.transcribe_button.setEnabled(True)
+        self.summarize_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.file_button.setEnabled(True)
         self.output_button.setEnabled(True)
         self.model_combo.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("0%")
 
     def open_model_manager(self):
         dialog = ModelManagerDialog(self)
@@ -656,6 +681,10 @@ class MainWindow(QMainWindow):
             self.elapsed_time_label.setText("Elapsed Time: 00:00:00")
             self.timer.start(1000)  # Update every second
 
+            # Create a new tab for the summary
+            self.summary_tab = self.add_new_tab("", f"{summary_type} (In Progress)")
+            self.tabbed_output.setCurrentWidget(self.summary_tab)
+
             self.summarization_thread = SummarizationThread(self.llm_manager, transcript, summary_type)
             self.summarization_thread.progress.connect(self.update_progress)
             self.summarization_thread.summary_chunk.connect(self.append_summary)
@@ -663,16 +692,19 @@ class MainWindow(QMainWindow):
             self.summarization_thread.error_occurred.connect(self.handle_summarization_error)
             self.summarization_thread.start()
 
+            self.current_process = self.summarization_thread  # Set the current process
+            self.cancel_button.setEnabled(True)  # Enable the cancel button
+
         except Exception as e:
             QMessageBox.warning(self, "Error", f"An error occurred while generating the summary: {str(e)}")
             self.update_progress(0)  # Reset progress bar
 
     def append_summary(self, text):
-        current_tab = self.tabbed_output.currentWidget()
-        if isinstance(current_tab, QTextEdit):
-            current_tab.append(text)
-    
+        if hasattr(self, 'summary_tab') and isinstance(self.summary_tab, QTextEdit):
+            self.summary_tab.append(text)
+
     def finalize_summary(self, final_summary):
+        self.reset_ui()
         end_time = time.time()
         self.end_time_label.setText(f"End Time: {time.strftime('%H:%M:%S')}")
         total_time = end_time - self.start_time
@@ -686,10 +718,19 @@ class MainWindow(QMainWindow):
         with open(summary_file, 'w', encoding='utf-8') as f:
             f.write(final_summary)
 
-        self.add_new_tab(f"{summary_type}:\n\n{final_summary}", summary_type)
-        QMessageBox.information(self, "Summary Generated", f"{summary_type} has been saved to {summary_file} and displayed in a new tab.")
+        # Update the existing summary tab with the final content
+        if hasattr(self, 'summary_tab') and isinstance(self.summary_tab, QTextEdit):
+            self.summary_tab.clear()
+            self.summary_tab.setPlainText(f"{summary_type}:\n\n{final_summary}")
+            
+            # Update the tab title to remove "In Progress"
+            tab_index = self.tabbed_output.indexOf(self.summary_tab)
+            self.tabbed_output.setTabText(tab_index, summary_type)
+
+        QMessageBox.information(self, "Summary Generated", f"{summary_type} has been saved to {summary_file} and displayed in the tab.")
     
     def handle_summarization_error(self, error_message):
+        self.reset_ui()
         self.timer.stop()
         QMessageBox.warning(self, "Error", f"An error occurred while generating the summary: {error_message}")
         self.update_progress(0)  # Reset progress bar
@@ -795,6 +836,7 @@ Provide a final, organized list of action items:"""
             "Summary of the transcript:",
             "Here's a summary of the meeting:",
             "Here's a concise summary of the conversation:",
+            "Here is a concise summary of the text:",
             "Here is a comprehensive summary of the meeting:",
             "Meeting Minutes:",
         ]
@@ -864,7 +906,7 @@ Provide a final, organized list of action items:"""
             return f"{int(h):02d}:{int(m):02d}:{int(s):02d},000"
 
     def quit_application(self):
-        self.cancel_transcription()
+        self.cancel_current_process()
         QApplication.quit()
 
 class SpeakerNamingDialog(QWidget):
@@ -906,7 +948,7 @@ class SpeakerNamingDialog(QWidget):
         self.setLayout(layout)
 
         # Connect cellChanged signal to apply_names method
-        self.table.cellChanged.connect(self.apply_names)
+        # self.table.cellChanged.connect(self.apply_names)
 
     def apply_names(self):
         speaker_names = {}
